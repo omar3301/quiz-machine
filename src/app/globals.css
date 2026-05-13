@@ -1,0 +1,156 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --ink: #0a0a0f;
+  --ink-soft: #13131a;
+  --ink-muted: #1c1c28;
+  --ink-subtle: #2a2a3d;
+  --paper: #f5f2eb;
+  --paper-warm: #ede9df;
+  --paper-dim: #d4cfc3;
+  --amber: #f59e0b;
+  --amber-light: #fcd34d;
+  --emerald: #10b981;
+  --rose: #f43f5e;
+  --text-primary: #f5f2eb;
+  --text-secondary: #a09d94;
+  --text-dim: #6b6860;
+  --border: rgba(245, 242, 235, 0.1);
+  --border-hover: rgba(245, 242, 235, 0.2);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: var(--ink);
+  color: var(--text-primary);
+  min-height: 100vh;
+}
+
+/* Noise texture overlay */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.03'/%3E%3C/svg%3E");
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--ink-soft);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--ink-subtle);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(245, 242, 235, 0.2);
+}
+
+/* Amber glow utility */
+.amber-glow {
+  box-shadow: 0 0 40px rgba(245, 158, 11, 0.15);
+}
+
+.amber-glow-text {
+  text-shadow: 0 0 30px rgba(245, 158, 11, 0.4);
+}
+
+/* Glass card */
+.glass {
+  background: rgba(28, 28, 40, 0.6);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border);
+}
+
+.glass-hover:hover {
+  background: rgba(28, 28, 40, 0.8);
+  border-color: var(--border-hover);
+}
+
+/* Shimmer loading */
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(245, 158, 11, 0.1) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2s infinite linear;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+/* Progress bar */
+.progress-bar {
+  background: linear-gradient(90deg, var(--amber), var(--amber-light));
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.5);
+}
+
+/* Option button states */
+.option-btn {
+  transition: all 0.2s ease;
+  border: 1px solid var(--border);
+}
+
+.option-btn:hover:not(:disabled) {
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.05);
+}
+
+.option-btn.selected {
+  border-color: var(--amber);
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.option-btn.correct {
+  border-color: var(--emerald);
+  background: rgba(16, 185, 129, 0.1);
+}
+
+.option-btn.incorrect {
+  border-color: var(--rose);
+  background: rgba(244, 63, 94, 0.1);
+}
+
+/* Stagger animation utility classes */
+.stagger-1 { animation-delay: 0.1s; }
+.stagger-2 { animation-delay: 0.2s; }
+.stagger-3 { animation-delay: 0.3s; }
+.stagger-4 { animation-delay: 0.4s; }
+.stagger-5 { animation-delay: 0.5s; }
+
+.animate-fade-up {
+  opacity: 0;
+  animation: fadeUp 0.6s ease forwards;
+}
+
+@keyframes fadeUp {
+  to { opacity: 1; transform: translateY(0); }
+  from { opacity: 0; transform: translateY(20px); }
+}
+
+/* File drop zone */
+.drop-zone-active {
+  border-color: var(--amber) !important;
+  background: rgba(245, 158, 11, 0.05) !important;
+  box-shadow: 0 0 40px rgba(245, 158, 11, 0.1) inset;
+}
