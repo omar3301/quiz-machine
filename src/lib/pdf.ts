@@ -1,22 +1,37 @@
-import { truncateText } from "./utils";
+// الدالة دي آمنة 100% على الآيفون وأي متصفح تاني
+export async function extractTextFromPDF(pdf: any, startPage: number, endPage: number) {
+  let fullText = "";
 
-export async function extractTextFromPDF(buffer: Buffer): Promise<string> {
-  // Dynamic import to avoid issues with edge runtime
-  const pdfParse = (await import("pdf-parse")).default;
+  // التأكد إن الصفحات في النطاق الصحيح
+  const actualStart = Math.max(1, startPage);
+  const actualEnd = Math.min(pdf.numPages, endPage);
 
-  const data = await pdfParse(buffer, {
-    // Limit parsing to first 200 pages for performance
-    max: 200,
-  });
+  for (let i = actualStart; i <= actualEnd; i++) {
+    try {
+      const page = await pdf.getPage(i);
+      const textContent = await page.getTextContent();
 
-  const text = data.text.trim();
-
-  if (!text || text.length < 50) {
-    throw new Error(
-      "Could not extract meaningful text from this PDF. It may be a scanned image or password-protected."
-    );
+      // فحص صارم عشان الآيفون ميضربش إيرور
+      if (textContent && textContent.items && Array.isArray(textContent.items)) {
+        let pageText = "";
+        
+        // استخدام for loop عادي جداً بدل map و join
+        for (let j = 0; j < textContent.items.length; j++) {
+          const item = textContent.items[j];
+          // نتأكد إن النص موجود فعلاً
+          if (item && typeof item.str === "string") {
+            pageText += item.str + " ";
+          }
+        }
+        
+        fullText += pageText + "\n";
+      }
+    } catch (err) {
+      console.warn(`تخطينا الصفحة رقم ${i} بسبب مشكلة في قراءتها:`, err);
+      // الكود هيكمل عادي للصفحة اللي بعدها بدل ما يعمل Crash للسايت كله
+      continue; 
+    }
   }
 
-  // Truncate to avoid AI token limits (~120k chars ≈ ~30k tokens)
-  return truncateText(text, 120000);
+  return fullText.trim();
 }

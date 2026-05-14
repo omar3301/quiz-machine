@@ -97,7 +97,7 @@ export default function HomePage() {
     return { from, to: cappedTo };
   };
 
-  // ── Extract text ────────────────────────────────────────────
+// ── Extract text ────────────────────────────────────────────
   const extractText = async (pdfFile: File, range: { from: number; to: number } | null): Promise<string> => {
     const pdfjsLib = await import("pdfjs-dist");
     pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
@@ -107,24 +107,45 @@ export default function HomePage() {
     const end   = Math.min(range?.to ?? pdf.numPages, pdf.numPages);
 
     let text = ""; let empty = 0;
+    
     for (let i = start; i <= end; i++) {
-      const page    = await pdf.getPage(i);
-      const content = await page.getTextContent();
-      const pt      = content.items.map((item) => ("str" in item ? (item as { str: string }).str : "")).join(" ").trim();
-      if (!pt) empty++;
-      text += pt + "\n";
+      try {
+        const page    = await pdf.getPage(i);
+        const content = await page.getTextContent();
+        
+        let pt = "";
+        // استخدام حلقة for آمنة جداً لمتصفح سفاري بدل map و join
+        if (content && content.items && content.items.length > 0) {
+          for (let j = 0; j < content.items.length; j++) {
+            const item = content.items[j] as any;
+            if (item && typeof item.str === "string") {
+              pt += item.str + " ";
+            }
+          }
+        }
+        
+        pt = pt.trim();
+        
+        if (!pt) empty++;
+        text += pt + "\n";
+      } catch (err) {
+        console.warn(`Error reading page ${i}:`, err);
+        empty++; // لو صفحة ضربت، نعتبرها فاضية ونكمل عادي
+        continue;
+      }
     }
 
     const trimmed = text.trim();
     const total   = end - start + 1;
+    
     if (!trimmed || trimmed.length < 100 || empty / total > 0.7) {
       setOcrActive(true);
       addToast("Scanned PDF detected — running OCR. Please wait…", "info");
       return runOCR(pdfFile, start, end, pdf.numPages);
     }
+    
     return trimmed.slice(0, 120000);
   };
-
   // ── OCR via Tesseract ───────────────────────────────────────
   const runOCR = async (pdfFile: File, start: number, end: number, totalPages: number): Promise<string> => {
     const pdfjsLib = await import("pdfjs-dist");
