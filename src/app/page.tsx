@@ -1,500 +1,449 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useDropzone } from "react-dropzone";
 import {
-  FileText,
-  Upload,
-  Sparkles,
-  ChevronDown,
-  AlertCircle,
-  X,
-  BookOpen,
-  Zap,
-  Shield,
+  FileText, Upload, Sparkles, X,
+  BookOpen, Zap, Shield, ScanText, AlignLeft, Instagram,
 } from "lucide-react";
 import { Difficulty } from "@/types/quiz";
 import { cn } from "@/lib/utils";
+import { ToastContainer, useToast } from "@/components/Toast";
+import PasscodeGate from "@/components/PasscodeGate";
 
-const QUESTION_OPTIONS = [5, 10, 15, 20];
-const DIFFICULTY_OPTIONS: {
-  value: Difficulty;
-  label: string;
-  desc: string;
-  color: string;
-}[] = [
-  {
-    value: "easy",
-    label: "Easy",
-    desc: "Facts & recall",
-    color: "emerald",
-  },
-  {
-    value: "medium",
-    label: "Medium",
-    desc: "Understanding",
-    color: "amber",
-  },
-  {
-    value: "hard",
-    label: "Hard",
-    desc: "Analysis & synthesis",
-    color: "rose",
-  },
+const QUESTION_OPTIONS = [5, 10, 15, 20, 25, 30];
+
+const DIFFICULTY_OPTIONS: { value: Difficulty; label: string; desc: string }[] = [
+  { value: "easy",   label: "Easy",   desc: "Facts & recall" },
+  { value: "medium", label: "Medium", desc: "Understanding"  },
+  { value: "hard",   label: "Hard",   desc: "Analysis"       },
 ];
+
+const LOADING_STEPS = [
+  "Reading your PDF…",
+  "Extracting concepts…",
+  "Crafting questions…",
+  "Finalizing quiz…",
+];
+
+function SectionLabel({ number, label }: { number: string; label: string }) {
+  return (
+    <p className="text-xs font-mono uppercase tracking-widest mb-3" style={{ color: "var(--text-secondary)" }}>
+      {number} — {label}
+    </p>
+  );
+}
 
 export default function HomePage() {
   const router = useRouter();
+  const { toasts, addToast, removeToast } = useToast();
+
   const [file, setFile] = useState<File | null>(null);
+  const [pdfPageCount, setPdfPageCount] = useState(0);
   const [numQuestions, setNumQuestions] = useState(10);
   const [difficulty, setDifficulty] = useState<Difficulty>("medium");
+  const [includeEssay, setIncludeEssay] = useState(true);
+  const [pageFrom, setPageFrom] = useState("");
+  const [pageTo, setPageTo]   = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [loadingStep, setLoadingStep] = useState(0);
+  const [ocrActive, setOcrActive] = useState(false);
 
-  const LOADING_STEPS = [
-    "Parsing your PDF…",
-    "Extracting key concepts…",
-    "Crafting questions with AI…",
-    "Finalizing your quiz…",
-  ];
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const onDrop = useCallback((acceptedFiles: File[]) => {
-    const dropped = acceptedFiles[0];
-    if (dropped && dropped.type === "application/pdf") {
-      setFile(dropped);
-      setError(null);
-    } else {
-      setError("Please upload a valid PDF file.");
-    }
+  // ── Drop ────────────────────────────────────────────────────
+  const onDrop = useCallback(async (accepted: File[]) => {
+    const dropped = accepted[0];
+    if (!dropped) return;
+    setFile(dropped);
+    setPageFrom(""); setPageTo("");
+
+    try {
+      const pdfjsLib = await import("pdfjs-dist");
+      pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+      const buf = await dropped.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+      setPdfPageCount(pdf.numPages);
+    } catch { setPdfPageCount(0); }
   }, []);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: { "application/pdf": [".pdf"] },
     maxFiles: 1,
-    maxSize: 20 * 1024 * 1024,
-    onDropRejected: (fileRejections) => {
-      const err = fileRejections[0]?.errors[0];
-      if (err?.code === "file-too-large") {
-        setError("PDF must be under 20MB.");
-      } else {
-        setError("Invalid file. Please upload a PDF.");
-      }
-    },
+    maxSize: 25 * 1024 * 1024,
+    onDropRejected: (r) =>
+      addToast(r[0]?.errors[0]?.code === "file-too-large" ? "PDF must be under 25MB." : "Please upload a PDF file.", "error"),
   });
 
-  const extractTextFromPDF = async (pdfFile: File): Promise<string> => {
-    // Dynamically import pdfjs-dist (runs in browser, no server needed)
+  // ── Page-range validation ───────────────────────────────────
+  const validatePageRange = (): { from: number; to: number } | null => {
+    if (!pageFrom && !pageTo) return null;
+    const from = parseInt(pageFrom || "1");
+    const to   = parseInt(pageTo   || String(pdfPageCount || 9999));
+    if (isNaN(from) || isNaN(to) || from < 1 || to < 1) {
+      addToast("Page numbers must be positive integers.", "error"); return null;
+    }
+    if (from > to) {
+      addToast(`"From" page (${from}) cannot exceed "To" page (${to}).`, "error"); return null;
+    }
+    if (pdfPageCount && from > pdfPageCount) {
+      addToast(`This PDF only has ${pdfPageCount} pages. Page ${from} doesn't exist.`, "error"); return null;
+    }
+    const cappedTo = pdfPageCount ? Math.min(to, pdfPageCount) : to;
+    if (pdfPageCount && to > pdfPageCount)
+      addToast(`Capping "To" at ${pdfPageCount} (last page).`, "info");
+    return { from, to: cappedTo };
+  };
+
+  // ── Extract text ────────────────────────────────────────────
+  const extractText = async (pdfFile: File, range: { from: number; to: number } | null): Promise<string> => {
     const pdfjsLib = await import("pdfjs-dist");
-    // Use locally served worker (copied to /public) — no CDN dependency
     pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+    const buf  = await pdfFile.arrayBuffer();
+    const pdf  = await pdfjsLib.getDocument({ data: buf }).promise;
+    const start = range?.from ?? 1;
+    const end   = Math.min(range?.to ?? pdf.numPages, pdf.numPages);
 
-    const arrayBuffer = await pdfFile.arrayBuffer();
-    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-
-    let fullText = "";
-    for (let i = 1; i <= pdf.numPages; i++) {
-      const page = await pdf.getPage(i);
+    let text = ""; let empty = 0;
+    for (let i = start; i <= end; i++) {
+      const page    = await pdf.getPage(i);
       const content = await page.getTextContent();
-      const pageText = content.items
-        .map((item) => ("str" in item ? (item as { str: string }).str : ""))
-        .join(" ");
-      fullText += pageText + "\n";
+      const pt      = content.items.map((item) => ("str" in item ? (item as { str: string }).str : "")).join(" ").trim();
+      if (!pt) empty++;
+      text += pt + "\n";
     }
 
-    const trimmed = fullText.trim();
-    if (!trimmed || trimmed.length < 50) {
-      throw new Error(
-        "Could not extract text from this PDF. It may be a scanned image or password-protected."
-      );
+    const trimmed = text.trim();
+    const total   = end - start + 1;
+    if (!trimmed || trimmed.length < 100 || empty / total > 0.7) {
+      setOcrActive(true);
+      addToast("Scanned PDF detected — running OCR. Please wait…", "info");
+      return runOCR(pdfFile, start, end, pdf.numPages);
     }
-
-    // Truncate to ~120k chars to stay within AI token limits
     return trimmed.slice(0, 120000);
   };
 
-  const handleGenerate = async () => {
-    if (!file) {
-      setError("Please upload a PDF first.");
-      return;
+  // ── OCR via Tesseract ───────────────────────────────────────
+  const runOCR = async (pdfFile: File, start: number, end: number, totalPages: number): Promise<string> => {
+    const pdfjsLib = await import("pdfjs-dist");
+    const { createWorker } = await import("tesseract.js");
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+
+    const buf    = await pdfFile.arrayBuffer();
+    const pdf    = await pdfjsLib.getDocument({ data: buf }).promise;
+    const worker = await createWorker("eng");
+    const canvas = document.createElement("canvas");
+    const ctx    = canvas.getContext("2d")!;
+    const maxPg  = Math.min(end, start + 19, totalPages); // max 20 pages for perf
+
+    let ocrText = "";
+    for (let i = start; i <= maxPg; i++) {
+      const page     = await pdf.getPage(i);
+      const viewport = page.getViewport({ scale: 2.0 });
+      canvas.width  = viewport.width;
+      canvas.height = viewport.height;
+      await page.render({ canvasContext: ctx as unknown as CanvasRenderingContext2D, viewport, canvas } as Parameters<typeof page.render>[0]).promise;
+      const { data } = await worker.recognize(canvas.toDataURL("image/png"));
+      ocrText += data.text + "\n";
     }
+    await worker.terminate();
+    canvas.remove();
 
-    setIsGenerating(true);
-    setError(null);
+    const trimmed = ocrText.trim();
+    if (!trimmed || trimmed.length < 50)
+      throw new Error("OCR failed — PDF may be too blurry or corrupted.");
+    return trimmed.slice(0, 120000);
+  };
 
-    // Cycle through loading steps
+  // ── Generate ────────────────────────────────────────────────
+  const handleGenerate = async () => {
+    if (!file) { addToast("Please upload a PDF first.", "error"); return; }
+
+    const range = validatePageRange();
+    // If user typed something invalid, validatePageRange already toasted and returns null for bad ranges
+    if ((pageFrom || pageTo) && range === null) return;
+
+    setIsGenerating(true); setOcrActive(false);
+
     let step = 0;
-    const interval = setInterval(() => {
+    intervalRef.current = setInterval(() => {
       step = Math.min(step + 1, LOADING_STEPS.length - 1);
       setLoadingStep(step);
-    }, 3000);
+    }, 4000);
+
+    const cleanup = () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      setLoadingStep(0);
+    };
 
     try {
-      // Step 1: Extract text in the browser (avoids payload size limits)
-      let pdfText: string;
-      try {
-        pdfText = await extractTextFromPDF(file);
-      } catch (err: unknown) {
-        throw new Error(
-          err instanceof Error ? err.message : "Failed to read PDF."
-        );
-      }
+      const pdfText = await extractText(file, range);
 
-      // Step 2: Send only the extracted text (tiny vs raw PDF binary)
-      const res = await fetch("/api/generate-quiz", {
+      const res  = await fetch("/api/generate-quiz", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          pdfText,
-          numQuestions,
-          difficulty,
-        }),
+        body: JSON.stringify({ pdfText, numQuestions, difficulty, includeEssay }),
       });
-
       const data = await res.json();
 
-      if (!res.ok || data.error) {
-        throw new Error(data.error ?? "Something went wrong.");
-      }
+      if (!res.ok || data.error) throw new Error(data.error ?? "Server error.");
 
-      // Store questions in sessionStorage and redirect
-      sessionStorage.setItem("quizQuestions", JSON.stringify(data.questions));
+      const questions = data.questions ?? data.quiz;
+      if (!questions?.length) throw new Error("No questions generated. Try a different PDF.");
+
+      sessionStorage.setItem("quizQuestions", JSON.stringify(questions));
       sessionStorage.setItem("quizConfig", JSON.stringify({ numQuestions, difficulty }));
 
-      clearInterval(interval);
+      cleanup();
       router.push("/quiz");
     } catch (err: unknown) {
-      clearInterval(interval);
-      setError(
-        err instanceof Error ? err.message : "An unexpected error occurred."
-      );
-      setIsGenerating(false);
-      setLoadingStep(0);
+      cleanup();
+      addToast(err instanceof Error ? err.message : "Unexpected error.", "error");
+      setIsGenerating(false); setOcrActive(false);
     }
   };
 
-  return (
-    <div className="min-h-screen relative overflow-hidden">
-      {/* Background ambient blobs */}
-      <div
-        className="absolute top-[-20%] left-[-10%] w-[600px] h-[600px] rounded-full opacity-20 pointer-events-none"
-        style={{
-          background:
-            "radial-gradient(circle, rgba(245,158,11,0.3) 0%, transparent 70%)",
-          filter: "blur(80px)",
-        }}
-      />
-      <div
-        className="absolute bottom-[-20%] right-[-10%] w-[500px] h-[500px] rounded-full opacity-15 pointer-events-none"
-        style={{
-          background:
-            "radial-gradient(circle, rgba(16,185,129,0.2) 0%, transparent 70%)",
-          filter: "blur(80px)",
-        }}
-      />
+  const sectionNum = (n: number) => {
+    // Offset section numbers if page range row is visible
+    const base = file && pdfPageCount > 0 ? n + 1 : n;
+    return String(base).padStart(2, "0");
+  };
 
-      <div className="relative z-10 max-w-4xl mx-auto px-6 py-16">
-        {/* Header */}
-        <header className="text-center mb-16 animate-fade-up">
-          <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full glass mb-8 text-xs font-mono tracking-widest text-amber-glow uppercase">
-            <Sparkles className="w-3 h-3" />
-            AI-Powered Quiz Generator
+  return (
+    <PasscodeGate>
+      <div className="min-h-screen relative overflow-hidden">
+        {/* Ambient */}
+        <div className="absolute top-[-20%] left-[-10%] w-[600px] h-[600px] rounded-full opacity-20 pointer-events-none"
+          style={{ background: "radial-gradient(circle, rgba(245,158,11,0.3) 0%, transparent 70%)", filter: "blur(80px)" }} />
+        <div className="absolute bottom-[-20%] right-[-10%] w-[500px] h-[500px] rounded-full opacity-15 pointer-events-none"
+          style={{ background: "radial-gradient(circle, rgba(139,92,246,0.2) 0%, transparent 70%)", filter: "blur(80px)" }} />
+
+        <div className="relative z-10 max-w-2xl mx-auto px-4 sm:px-6 py-12 sm:py-16">
+
+          {/* Header */}
+          <header className="text-center mb-10 animate-fade-up">
+            <h1 className="font-display text-5xl sm:text-6xl font-bold tracking-tight leading-none mb-4">
+              Quiz<span className="italic amber-glow-text" style={{ color: "var(--amber-light)" }}>Forge</span>
+            </h1>
+            <p className="text-base sm:text-lg max-w-md mx-auto leading-relaxed" style={{ color: "var(--text-secondary)" }}>
+              Upload any PDF and generate a smart, interactive quiz in seconds.
+            </p>
+          </header>
+
+          {/* Pills */}
+          <div className="flex flex-wrap justify-center gap-2 mb-8">
+            {[
+              { icon: Zap, text: "Instant" },
+              { icon: BookOpen, text: "Smart questions" },
+              { icon: ScanText, text: "OCR support" },
+              { icon: Shield, text: "Private" },
+            ].map(({ icon: Icon, text }) => (
+              <div key={text} className="flex items-center gap-1.5 px-3 py-1.5 rounded-full glass text-xs"
+                style={{ color: "var(--text-secondary)" }}>
+                <Icon className="w-3 h-3" style={{ color: "var(--amber)" }} />
+                {text}
+              </div>
+            ))}
           </div>
 
-          <h1
-            className="font-display text-6xl md:text-7xl font-800 tracking-tight leading-none mb-6"
-            style={{ color: "var(--text-primary)" }}
-          >
-            Quiz
-            <span
-              className="italic amber-glow-text"
-              style={{ color: "var(--amber-light)" }}
-            >
-              Forge
-            </span>
-          </h1>
+          {/* Card */}
+          <div className="glass rounded-2xl p-6 sm:p-8 animate-fade-up">
 
-          <p
-            className="text-lg md:text-xl max-w-lg mx-auto leading-relaxed"
-            style={{ color: "var(--text-secondary)" }}
-          >
-            Upload any PDF — textbooks, papers, notes — and forge an
-            intelligent quiz in seconds.
-          </p>
-        </header>
-
-        {/* Feature pills */}
-        <div
-          className="flex flex-wrap justify-center gap-3 mb-12 animate-fade-up stagger-2"
-          style={{ opacity: 0 }}
-        >
-          {[
-            { icon: Zap, text: "Instant generation" },
-            { icon: BookOpen, text: "Smart questions" },
-            { icon: Shield, text: "Works offline" },
-          ].map(({ icon: Icon, text }) => (
-            <div
-              key={text}
-              className="flex items-center gap-2 px-4 py-2 rounded-full glass text-sm"
-              style={{ color: "var(--text-secondary)" }}
-            >
-              <Icon className="w-3.5 h-3.5" style={{ color: "var(--amber)" }} />
-              {text}
-            </div>
-          ))}
-        </div>
-
-        {/* Main card */}
-        <div
-          className="glass rounded-2xl p-8 md:p-10 animate-fade-up stagger-3"
-          style={{ opacity: 0 }}
-        >
-          {/* Drop Zone */}
-          <div className="mb-8">
-            <label
-              className="block text-sm font-medium mb-3 font-mono tracking-wider uppercase"
-              style={{ color: "var(--text-secondary)" }}
-            >
-              01 — Upload PDF
-            </label>
-
-            <div
-              {...getRootProps()}
-              className={cn(
-                "relative border-2 border-dashed rounded-xl p-10 text-center cursor-pointer transition-all duration-300",
-                isDragActive
-                  ? "drop-zone-active"
-                  : file
-                  ? "border-emerald-500/50 bg-emerald-500/5"
-                  : "border-white/10 hover:border-amber-500/40 hover:bg-amber-500/3"
-              )}
-            >
+            {/* 01 Upload */}
+            <SectionLabel number="01" label="Upload PDF" />
+            <div {...getRootProps()} className={cn(
+              "border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all duration-300 mb-6",
+              isDragActive ? "drop-zone-active"
+                : file ? "border-emerald-500/50 bg-emerald-500/5"
+                : "border-white/10 hover:border-amber-500/40"
+            )}>
               <input {...getInputProps()} />
-
               {file ? (
-                <div className="flex items-center justify-center gap-4">
-                  <div
-                    className="w-12 h-12 rounded-xl flex items-center justify-center"
-                    style={{ background: "rgba(16,185,129,0.15)" }}
-                  >
-                    <FileText
-                      className="w-6 h-6"
-                      style={{ color: "var(--emerald)" }}
-                    />
+                <div className="flex items-center gap-3 text-left">
+                  <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0"
+                    style={{ background: "rgba(16,185,129,0.15)" }}>
+                    <FileText className="w-5 h-5" style={{ color: "var(--emerald)" }} />
                   </div>
-                  <div className="text-left">
-                    <p className="font-medium text-sm">{file.name}</p>
-                    <p
-                      className="text-xs mt-0.5"
-                      style={{ color: "var(--text-secondary)" }}
-                    >
+                  <div className="flex-1 min-w-0">
+                    <p className="font-medium text-sm truncate">{file.name}</p>
+                    <p className="text-xs mt-0.5" style={{ color: "var(--text-secondary)" }}>
                       {(file.size / 1024 / 1024).toFixed(2)} MB
+                      {pdfPageCount > 0 && ` · ${pdfPageCount} pages`}
                     </p>
                   </div>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setFile(null);
-                    }}
-                    className="ml-auto p-2 rounded-lg hover:bg-white/10 transition-colors"
-                  >
+                  <button onClick={(e) => { e.stopPropagation(); setFile(null); setPdfPageCount(0); setPageFrom(""); setPageTo(""); }}
+                    className="p-2 rounded-lg hover:bg-white/10 transition-colors shrink-0">
                     <X className="w-4 h-4" style={{ color: "var(--text-dim)" }} />
                   </button>
                 </div>
               ) : (
                 <div>
-                  <div
-                    className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4"
-                    style={{ background: "rgba(245,158,11,0.1)" }}
-                  >
-                    <Upload
-                      className={cn(
-                        "w-7 h-7 transition-transform",
-                        isDragActive ? "scale-125" : ""
-                      )}
-                      style={{ color: "var(--amber)" }}
-                    />
+                  <div className="w-14 h-14 rounded-2xl flex items-center justify-center mx-auto mb-3"
+                    style={{ background: "rgba(245,158,11,0.1)" }}>
+                    <Upload className={cn("w-6 h-6 transition-transform", isDragActive && "scale-125")}
+                      style={{ color: "var(--amber)" }} />
                   </div>
-                  <p className="font-medium mb-1">
-                    {isDragActive
-                      ? "Drop it like it's hot…"
-                      : "Drag & drop your PDF here"}
+                  <p className="font-medium text-sm mb-1">
+                    {isDragActive ? "Drop it here…" : "Drag & drop your PDF"}
                   </p>
-                  <p
-                    className="text-sm"
-                    style={{ color: "var(--text-secondary)" }}
-                  >
-                    or{" "}
-                    <span
-                      className="underline underline-offset-2 cursor-pointer"
-                      style={{ color: "var(--amber)" }}
-                    >
-                      browse files
-                    </span>{" "}
-                    — max 20MB
+                  <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                    or <span className="underline underline-offset-2" style={{ color: "var(--amber)" }}>browse files</span> — max 25MB
                   </p>
                 </div>
               )}
             </div>
-          </div>
 
-          {/* Configuration */}
-          <div className="grid md:grid-cols-2 gap-6 mb-8">
-            {/* Num Questions */}
-            <div>
-              <label
-                className="block text-sm font-medium mb-3 font-mono tracking-wider uppercase"
-                style={{ color: "var(--text-secondary)" }}
-              >
-                02 — Questions
-              </label>
-              <div className="relative">
-                <select
-                  value={numQuestions}
-                  onChange={(e) => setNumQuestions(Number(e.target.value))}
-                  className="w-full px-4 py-3 rounded-xl appearance-none font-body font-medium cursor-pointer focus:outline-none transition-all"
-                  style={{
-                    background: "rgba(28,28,40,0.8)",
-                    border: "1px solid var(--border)",
-                    color: "var(--text-primary)",
-                  }}
-                >
-                  {QUESTION_OPTIONS.map((n) => (
-                    <option key={n} value={n} style={{ background: "#13131A" }}>
-                      {n} Questions
-                    </option>
+            {/* 02 Page Range (conditional) */}
+            {file && pdfPageCount > 0 && (
+              <div className="mb-6">
+                <SectionLabel number="02" label={`Page Range — ${pdfPageCount} pages total`} />
+                <div className="grid grid-cols-2 gap-3">
+                  {[
+                    { label: "From page", val: pageFrom, set: setPageFrom, placeholder: "1" },
+                    { label: "To page",   val: pageTo,   set: setPageTo,   placeholder: String(pdfPageCount) },
+                  ].map(({ label, val, set, placeholder }) => (
+                    <div key={label}>
+                      <p className="text-xs font-mono mb-1.5" style={{ color: "var(--text-dim)" }}>{label}</p>
+                      <input type="number" min={1} max={pdfPageCount}
+                        value={val} onChange={(e) => set(e.target.value)}
+                        placeholder={placeholder}
+                        className="w-full px-4 py-2.5 rounded-xl text-sm focus:outline-none transition-all appearance-none"
+                        style={{ background: "rgba(10,10,15,0.6)", border: "1px solid var(--border)", color: "var(--text-primary)" }}
+                      />
+                    </div>
                   ))}
-                </select>
-                <ChevronDown
-                  className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 pointer-events-none"
-                  style={{ color: "var(--text-dim)" }}
-                />
+                </div>
+                <p className="text-xs mt-2 font-mono" style={{ color: "var(--text-dim)" }}>
+                  Leave blank to process all pages
+                </p>
               </div>
-            </div>
+            )}
 
-            {/* Difficulty */}
-            <div>
-              <label
-                className="block text-sm font-medium mb-3 font-mono tracking-wider uppercase"
-                style={{ color: "var(--text-secondary)" }}
-              >
-                03 — Difficulty
-              </label>
-              <div className="grid grid-cols-3 gap-2">
-                {DIFFICULTY_OPTIONS.map(({ value, label, desc, color }) => (
-                  <button
-                    key={value}
-                    onClick={() => setDifficulty(value)}
-                    className={cn(
-                      "px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 text-center",
-                      difficulty === value
-                        ? color === "emerald"
-                          ? "border border-emerald-500/60 bg-emerald-500/10 text-emerald-400"
-                          : color === "amber"
-                          ? "border border-amber-500/60 bg-amber-500/10 text-amber-400"
-                          : "border border-rose-500/60 bg-rose-500/10 text-rose-400"
-                        : "border border-white/10 hover:border-white/20 text-gray-400 hover:text-gray-300"
-                    )}
-                  >
-                    <div className="font-semibold">{label}</div>
-                    <div className="text-xs opacity-70 mt-0.5">{desc}</div>
+            {/* Questions count */}
+            <div className="mb-6">
+              <SectionLabel number={sectionNum(2)} label="Number of Questions" />
+              <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
+                {QUESTION_OPTIONS.map((n) => (
+                  <button key={n} onClick={() => setNumQuestions(n)}
+                    className={cn("py-2.5 rounded-xl text-sm font-semibold transition-all duration-200",
+                      numQuestions !== n && "border border-white/10 hover:border-white/20 text-gray-400 hover:text-gray-200")}
+                    style={numQuestions === n ? {
+                      background: "linear-gradient(135deg, #F59E0B, #FCD34D)", color: "#0A0A0F"
+                    } : {}}>
+                    {n}
                   </button>
                 ))}
               </div>
             </div>
+
+            {/* Difficulty */}
+            <div className="mb-6">
+              <SectionLabel number={sectionNum(3)} label="Difficulty" />
+              <div className="grid grid-cols-3 gap-2">
+                {DIFFICULTY_OPTIONS.map(({ value, label, desc }) => {
+                  const activeClass = { easy: "border-emerald-500/60 bg-emerald-500/10 text-emerald-400", medium: "border-amber-500/60 bg-amber-500/10 text-amber-400", hard: "border-rose-500/60 bg-rose-500/10 text-rose-400" }[value];
+                  return (
+                    <button key={value} onClick={() => setDifficulty(value)}
+                      className={cn("px-2 py-3 rounded-xl text-sm font-medium transition-all duration-200 text-center border",
+                        difficulty === value ? activeClass : "border-white/10 text-gray-400 hover:border-white/20 hover:text-gray-300")}>
+                      <div className="font-semibold">{label}</div>
+                      <div className="text-xs opacity-70 mt-0.5 hidden sm:block">{desc}</div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Essay toggle */}
+            <div className="mb-8">
+              <SectionLabel number={sectionNum(4)} label="Question Types" />
+              <button onClick={() => setIncludeEssay(!includeEssay)}
+                className="w-full flex items-center justify-between px-4 py-3.5 rounded-xl transition-all duration-200"
+                style={{
+                  background: includeEssay ? "rgba(139,92,246,0.08)" : "rgba(10,10,15,0.4)",
+                  border: `1px solid ${includeEssay ? "rgba(139,92,246,0.3)" : "var(--border)"}`,
+                }}>
+                <div className="flex items-center gap-3">
+                  <AlignLeft className="w-4 h-4 shrink-0" style={{ color: includeEssay ? "#a78bfa" : "var(--text-dim)" }} />
+                  <div className="text-left">
+                    <p className="text-sm font-medium" style={{ color: includeEssay ? "#c4b5fd" : "var(--text-secondary)" }}>
+                      Include Essay Questions
+                    </p>
+                    <p className="text-xs mt-0.5" style={{ color: "var(--text-dim)" }}>
+                      {includeEssay ? "Mix of multiple choice + short answer" : "Multiple choice only"}
+                    </p>
+                  </div>
+                </div>
+                <div className="relative w-11 h-6 shrink-0 ml-3">
+                  <div className="absolute inset-0 rounded-full transition-all duration-300"
+                    style={{ background: includeEssay ? "rgba(139,92,246,0.6)" : "rgba(255,255,255,0.1)" }} />
+                  <div className="absolute top-0.5 w-5 h-5 rounded-full bg-white shadow-sm transition-all duration-300"
+                    style={{ left: includeEssay ? "calc(100% - 22px)" : "2px" }} />
+                </div>
+              </button>
+            </div>
+
+            {/* OCR status */}
+            {ocrActive && (
+              <div className="flex items-center gap-3 px-4 py-3 rounded-xl mb-5"
+                style={{ background: "rgba(139,92,246,0.08)", border: "1px solid rgba(139,92,246,0.2)" }}>
+                <ScanText className="w-4 h-4 shrink-0 animate-pulse" style={{ color: "#a78bfa" }} />
+                <p className="text-sm" style={{ color: "#c4b5fd" }}>Running OCR on scanned pages…</p>
+              </div>
+            )}
+
+            {/* Generate */}
+            <button onClick={handleGenerate} disabled={isGenerating || !file}
+              className={cn(
+                "w-full py-4 rounded-xl font-display font-semibold text-base tracking-wide transition-all duration-300 relative overflow-hidden",
+                isGenerating || !file ? "opacity-50 cursor-not-allowed" : "hover:scale-[1.01] active:scale-[0.99]"
+              )}
+              style={{
+                background: isGenerating ? "rgba(245,158,11,0.3)" : "linear-gradient(135deg, #F59E0B 0%, #FCD34D 100%)",
+                color: isGenerating ? "rgba(245,242,235,0.6)" : "#0A0A0F",
+                boxShadow: !isGenerating && file ? "0 0 28px rgba(245,158,11,0.25)" : "none",
+              }}>
+              {isGenerating && <div className="absolute inset-0 shimmer" />}
+              <span className="relative flex items-center justify-center gap-2">
+                {isGenerating ? (
+                  <>
+                    <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none">
+                      <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3"
+                        strokeDasharray="60" strokeDashoffset="20" strokeLinecap="round" />
+                    </svg>
+                    {LOADING_STEPS[loadingStep]}
+                  </>
+                ) : (
+                  <><Sparkles className="w-4 h-4" />Generate Quiz</>
+                )}
+              </span>
+            </button>
+
+            {!file && (
+              <p className="text-center text-xs mt-3" style={{ color: "var(--text-dim)" }}>
+                Upload a PDF to get started
+              </p>
+            )}
           </div>
 
-          {/* Error */}
-          {error && (
-            <div
-              className="flex items-start gap-3 px-4 py-3 rounded-xl mb-6"
-              style={{
-                background: "rgba(244,63,94,0.1)",
-                border: "1px solid rgba(244,63,94,0.3)",
-              }}
-            >
-              <AlertCircle
-                className="w-4 h-4 mt-0.5 shrink-0"
-                style={{ color: "var(--rose)" }}
-              />
-              <p className="text-sm" style={{ color: "#fda4af" }}>
-                {error}
-              </p>
-            </div>
-          )}
-
-          {/* Generate Button */}
-          <button
-            onClick={handleGenerate}
-            disabled={isGenerating || !file}
-            className={cn(
-              "w-full py-4 rounded-xl font-display font-semibold text-base tracking-wide transition-all duration-300 relative overflow-hidden",
-              isGenerating || !file
-                ? "opacity-50 cursor-not-allowed"
-                : "hover:scale-[1.01] hover:shadow-lg active:scale-[0.99]"
-            )}
-            style={{
-              background: isGenerating
-                ? "rgba(245,158,11,0.3)"
-                : "linear-gradient(135deg, #F59E0B 0%, #FCD34D 100%)",
-              color: isGenerating ? "rgba(245,242,235,0.7)" : "#0A0A0F",
-              boxShadow: !isGenerating && file
-                ? "0 0 30px rgba(245,158,11,0.3)"
-                : "none",
-            }}
-          >
-            {isGenerating && (
-              <div className="absolute inset-0 shimmer" />
-            )}
-            <span className="relative flex items-center justify-center gap-2">
-              {isGenerating ? (
-                <>
-                  <svg
-                    className="animate-spin w-4 h-4"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                  >
-                    <circle
-                      cx="12"
-                      cy="12"
-                      r="10"
-                      stroke="currentColor"
-                      strokeWidth="3"
-                      strokeDasharray="60"
-                      strokeDashoffset="20"
-                      strokeLinecap="round"
-                    />
-                  </svg>
-                  {LOADING_STEPS[loadingStep]}
-                </>
-              ) : (
-                <>
-                  <Sparkles className="w-4 h-4" />
-                  Generate Quiz
-                </>
-              )}
-            </span>
-          </button>
-
-          {!file && (
-            <p
-              className="text-center text-xs mt-3"
-              style={{ color: "var(--text-dim)" }}
-            >
-              Upload a PDF to get started
-            </p>
-          )}
+          {/* Footer branding */}
+          <footer className="text-center mt-8">
+            <a href="https://www.instagram.com/omar_abomosslam/"
+              target="_blank" rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-full glass hover:bg-white/5 transition-all group">
+              <Instagram className="w-3.5 h-3.5" style={{ color: "rgba(245,158,11,0.6)" }} />
+              <span className="text-xs font-mono group-hover:text-amber-400 transition-colors"
+                style={{ color: "var(--text-dim)" }}>
+                Built by Omar Abomosslam
+              </span>
+            </a>
+          </footer>
         </div>
 
-        {/* Footer */}
-        <footer className="text-center mt-10">
-          <p className="text-xs font-mono" style={{ color: "var(--text-dim)" }}>
-            Powered by Gemini AI · Your data is never stored
-          </p>
-        </footer>
+        <ToastContainer toasts={toasts} onRemove={removeToast} />
       </div>
-    </div>
+    </PasscodeGate>
   );
 }
